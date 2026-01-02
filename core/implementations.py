@@ -14,6 +14,10 @@ class QuaternionAlgebra(Algebra):
     def dim(self):
         return 4
 
+    @property
+    def mat_dim(self):
+        return 4
+
     def expand_matrix(self, weights):
         r, i, j, k = weights
         # Row-major Hamilton Product
@@ -32,6 +36,10 @@ class ComplexAlgebra(Algebra):
     def dim(self):
         return 2
 
+    @property
+    def mat_dim(self):
+        return 2
+
     def expand_matrix(self, weights):
         r, i = weights
         # [ r  -i ]
@@ -39,6 +47,23 @@ class ComplexAlgebra(Algebra):
         row1 = torch.cat([r, -i], dim=1)
         row2 = torch.cat([i,  r], dim=1)
         return torch.cat([row1, row2], dim=0)
+
+class RealAlgebra(Algebra):
+    """
+    Standard Real Numbers (R).
+    This reduces the AlgebraNet to a standard Neural Network.
+    Useful for benchmarking and baselines within the same framework.
+    """
+    @property
+    def dim(self):
+        return 1
+
+    @property
+    def mat_dim(self):
+        return 1
+
+    def expand_matrix(self, weights):
+        return weights[0]
 
 # ==========================================
 # 2. EXOTIC / GEOMETRIC ALGEBRAS
@@ -56,10 +81,12 @@ class DualNumberAlgebra(Algebra):
     def dim(self):
         return 2
 
+    @property
+    def mat_dim(self):
+        return 2
+
     def expand_matrix(self, weights):
         a, b = weights
-        # Row 1: a, 0
-        # Row 2: b, a
         zeros = torch.zeros_like(a)
         
         row1 = torch.cat([a, zeros], dim=1)
@@ -78,9 +105,12 @@ class SplitComplexAlgebra(Algebra):
     def dim(self):
         return 2
 
+    @property
+    def mat_dim(self):
+        return 2
+
     def expand_matrix(self, weights):
         x, y = weights
-        # Note the symmetry compared to Complex (no negative sign)
         row1 = torch.cat([x, y], dim=1)
         row2 = torch.cat([y, x], dim=1)
         return torch.cat([row1, row2], dim=0)
@@ -92,61 +122,65 @@ class SplitComplexAlgebra(Algebra):
 class MatrixAlgebra(Algebra):
     """
     General Matrix Algebra M_n(R).
-    This corresponds to the user's request for GL(n, R) style weights.
+    This corresponds to GL(n, R) style weights.
     
     Instead of a scalar weight, every connection is an n x n block of FREE parameters.
-    Constraint: None (Dense blocks), but enforces block-locality in the network structure.
     """
     def __init__(self, n):
         self.n = n
         
     @property
     def dim(self):
-        return self.n * self.n # A 2x2 matrix has 4 parameters
+        return self.n * self.n 
 
-    def expand_matrix(self, weights):
-        # 'weights' is a list of n*n tensors.
-        # We need to arrange them into an n x n block structure.
-        # Let's assume the list is row-major: w_00, w_01, w_10, w_11...
-        
+    @property
+    def mat_dim(self):
+        return self.n
+
+    def expand_matrix(self, weights):        
         n = self.n
         rows = []
         
         for i in range(n):
-            # Collect the n chunks for this row
             row_chunks = []
             for j in range(n):
                 idx = i * n + j
                 row_chunks.append(weights[idx])
             
-            # Concatenate them horizontally
             rows.append(torch.cat(row_chunks, dim=1))
             
-        # Concatenate rows vertically
         return torch.cat(rows, dim=0)
 
-class SO3Algebra(Algebra):
+class SOnAlgebra(Algebra):
     """
-    Lie Algebra so(3): Skew-symmetric 3x3 matrices.
-    Used for learning infinitesimal 3D rotations (angular velocities).
-    
-    Parameters: 3 (x, y, z)
-    Structure:
-    [  0  -z   y ]
-    [  z   0  -x ]
-    [ -y   x   0 ]
+    Lie Algebra so(n): Skew-symmetric n x n matrices.
+    Used for learning n-dimensional rotations.
     """
+    def __init__(self, n):
+        self.n = n
+        self.num_params = (n * (n - 1)) // 2
+
     @property
     def dim(self):
-        return 3
+        return self.num_params
+
+    @property
+    def mat_dim(self):
+        return self.n 
 
     def expand_matrix(self, weights):
-        x, y, z = weights
-        zeros = torch.zeros_like(x)
+        n = self.n
+        ref = weights[0]
+        zeros = torch.zeros_like(ref)
+        grid = [[zeros for _ in range(n)] for _ in range(n)]
         
-        # Build the skew-symmetric block
-        row1 = torch.cat([zeros, -z,      y], dim=1)
-        row2 = torch.cat([z,     zeros,  -x], dim=1)
-        row3 = torch.cat([-y,    x,   zeros], dim=1)
+        weight_idx = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                w = weights[weight_idx]
+                grid[i][j] = w
+                grid[j][i] = -w
+                weight_idx += 1
         
-        return torch.cat([row1, row2, row3], dim=0)
+        rows = [torch.cat(row_list, dim=1) for row_list in grid]
+        return torch.cat(rows, dim=0)

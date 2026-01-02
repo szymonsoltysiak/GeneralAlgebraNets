@@ -9,115 +9,93 @@ class SplitActivation(nn.Module):
     Example: For a Complex number (a + bi), SplitReLU outputs:
     ReLU(a) + i*ReLU(b)
     
-    Pros: Very fast, standard gradients.
-    Cons: Not rotationally equivariant. Breaks the geometry.
+    Works automatically for any tensor shape because standard activations 
+    are element-wise.
     """
     def __init__(self, activation_fn=nn.ReLU()):
         super().__init__()
         self.act = activation_fn
 
     def forward(self, x):
-        # Since our "Algebra Tensor" is just a flattened real tensor,
-        # standard element-wise application IS split activation.
         return self.act(x)
 
 
 class MagnitudeActivation(nn.Module):
     """
     Applies an activation based on the norm (magnitude) of the algebraic number.
-    Often called 'ModReLU' in Complex/Quaternion literature.
+    Formula: out = z * ReLU(|z| + bias) / |z|
     
-    Formula: 
-    scale = ReLU(|z| + bias) / |z|
-    out = z * scale
-    
-    Result: The vector 'z' is scaled radially. Its direction (phase/orientation) 
-    is perfectly preserved.
+    PRESERVES: Orientation/Phase
+    CHANGES: Magnitude
     """
     def __init__(self, features, algebra_dim, bias=True):
-        """
-        Args:
-            features (int): Number of independent algebraic features (channels).
-                            (e.g., if input is 128 floats and dim is 4, features=32)
-            algebra_dim (int): Dimensionality of the algebra (2=Complex, 4=Quat).
-            bias (bool): Whether to learn a threshold parameter (the 'dead zone' radius).
-        """
         super().__init__()
         self.dim = algebra_dim
-        self.features = features
         
-        # Learnable bias parameter.
-        # It determines the "radius" below which the neuron is inactive.
-        # Initialized to 0 or slightly negative to ensure initial flow.
+        assert features % algebra_dim == 0, "Features must be divisible by algebra_dim"
+        self.logical_features = features // algebra_dim
+        
         if bias:
-            self.bias = nn.Parameter(torch.zeros(features))
+            self.bias = nn.Parameter(torch.zeros(self.logical_features))
         else:
             self.register_parameter('bias', None)
             
-        self.epsilon = 1e-5 # For numerical stability
+        self.epsilon = 1e-5
 
     def forward(self, x):
-        # x shape: [Batch, Total_Real_Dimensions]
-        batch_size = x.shape[0]
+        ch_dim = 1 if x.dim() > 2 else -1
         
-        # 1. Reshape to separate algebraic components
-        # View as: [Batch, Features, Algebra_Dim]
-        x_reshaped = x.view(batch_size, self.features, self.dim)
+        x_poly = x.unflatten(ch_dim, (self.logical_features, self.dim))
         
-        # 2. Compute Magnitude (L2 Norm) along the last dimension
-        # Shape: [Batch, Features, 1]
-        magnitude = torch.norm(x_reshaped, p=2, dim=2, keepdim=True)
+        alg_dim = ch_dim + 1 if ch_dim != -1 else -1
         
-        # 3. Calculate Scaling Factor
+        magnitude = torch.norm(x_poly, p=2, dim=alg_dim, keepdim=True)
+        
         if self.bias is not None:
-            # Broadcast bias: [Features] -> [1, Features, 1]
-            b = self.bias.view(1, -1, 1)
-            # ReLU(|z| + b). If |z| + b < 0, the neuron dies.
+            shape = [1] * x_poly.dim()
+            shape[ch_dim] = self.logical_features
+            
+            b = self.bias.view(*shape)
             active_magnitude = F.relu(magnitude + b)
         else:
             active_magnitude = F.relu(magnitude)
             
-        # 4. Apply Scaling
-        # We divide by magnitude to get the unit vector, then multiply by active_magnitude
-        # optimization: scale = active_magnitude / (magnitude + eps)
         scale = active_magnitude / (magnitude + self.epsilon)
         
-        # Broadcast scale to all components
-        # [B, F, 1] * [B, F, D] = [B, F, D]
-        out_reshaped = x_reshaped * scale
+        out_poly = x_poly * scale
         
-        # 5. Flatten back to original shape
-        return out_reshaped.view(batch_size, -1)
+        return out_poly.flatten(ch_dim, alg_dim)
+
 
 class GatedAlgebraActivation(nn.Module):
     """
-    A more advanced activation where a separate "Gate" determines the amplitude.
-    
-    z_out = z_in * Sigmoid(Linear(z_in))
+    z_out = z_in * Sigmoid(w * |z| + b)
     """
     def __init__(self, in_features, algebra_dim):
         super().__init__()
         self.dim = algebra_dim
-        self.features = in_features // algebra_dim
+        assert in_features % algebra_dim == 0
+        self.logical_features = in_features // algebra_dim
         
-        # A lightweight real-valued projection to learn the gate
-        # Maps magnitude -> scalar gate value
-        self.gate_b = nn.Parameter(torch.zeros(self.features))
-        self.gate_w = nn.Parameter(torch.ones(self.features))
+        self.gate_w = nn.Parameter(torch.ones(self.logical_features))
+        self.gate_b = nn.Parameter(torch.zeros(self.logical_features))
 
     def forward(self, x):
-        batch_size = x.shape[0]
-        x_reshaped = x.view(batch_size, self.features, self.dim)
+        ch_dim = 1 if x.dim() > 2 else -1
         
-        # Compute norms: [B, F]
-        norms = torch.norm(x_reshaped, p=2, dim=2)
+        x_poly = x.unflatten(ch_dim, (self.logical_features, self.dim))
+        alg_dim = ch_dim + 1 if ch_dim != -1 else -1
         
-        # Compute Gate: Sigmoid(w * norm + b)
-        # This allows the network to learn smooth "on/off" regions based on amplitude
-        gate = torch.sigmoid(self.gate_w * norms + self.gate_b)
+        norms = torch.norm(x_poly, p=2, dim=alg_dim, keepdim=True)
         
-        # Apply gate (broadcasting)
-        # [B, F, D] * [B, F, 1]
-        out = x_reshaped * gate.unsqueeze(-1)
+        shape = [1] * x_poly.dim()
+        shape[ch_dim] = self.logical_features
         
-        return out.view(batch_size, -1)
+        w = self.gate_w.view(*shape)
+        b = self.gate_b.view(*shape)
+        
+        gate = torch.sigmoid(w * norms + b)
+        
+        out = x_poly * gate
+        
+        return out.flatten(ch_dim, alg_dim)

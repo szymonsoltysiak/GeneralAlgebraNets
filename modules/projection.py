@@ -8,15 +8,23 @@ class AlgebraToReal(nn.Module):
         self.mode = mode
 
     def forward(self, x):
-        # x shape: [Batch, Features * Dim]
+        ch_dim = 1 if x.dim() > 2 else -1
+
         if self.mode == 'magnitude':
-            # Reshape to separate algebraic components
-            # [B, Features, Dim]
-            x_reshaped = x.view(x.shape[0], -1, self.dim)
-            # Compute Euclidean norm across the algebraic dimension
-            # Result: [B, Features]
-            return torch.norm(x_reshaped, p=2, dim=2)
+            x_poly = x.unflatten(ch_dim, (-1, self.dim))
             
+            target_dim = ch_dim + 1 if ch_dim >= 0 else -1
+            
+            return torch.norm(x_poly, p=2, dim=target_dim)
+            
+        elif self.mode == 'first':
+            x_poly = x.unflatten(ch_dim, (-1, self.dim))
+            
+            target_dim = ch_dim + 1 if ch_dim >= 0 else -1
+            return x_poly.select(dim=target_dim, index=0)
+
         elif self.mode == 'flatten':
-             # Just treat all components as independent real features
-             return x
+            return x
+            
+        else:
+            raise NotImplementedError(f"Mode {self.mode} not implemented.")
